@@ -186,8 +186,8 @@ func getNotProcessed(ethHandle *ethtool.Ethtool, iface string, seconds int, acti
 	var ppsAction uint64 = totAction / uint64(seconds)
 	var pps uint64 = ppsPhy - ppsAction
 
-	p := message.NewPrinter(language.English)
-	p.Printf("Not Processed per second %d\n", int(pps))
+	// p := message.NewPrinter(language.English)
+	// p.Printf("Not Processed per second %d\n", int(pps))
 
 	return int(pps)
 }
@@ -287,22 +287,25 @@ test and update the current RX Queue size if there is a gain in throughput
 */
 func changeRxQueue(ethHandle *ethtool.Ethtool, config Config, interval int, extDrop uint64) (Config, uint64, float64) {
 	var listRxQueue = []uint32{128, 256, 512, 1024, 2048, 4096, 8192}
+
 	oldPPS := getAction(ethHandle, config.Iface, interval, config.Action)
 	oldCPU := getAverageCPUPercentage(config.Weight)
 	oldNotProcessed := getNotProcessed(ethHandle, config.Iface, interval, config.Action)
+
 	var nextPPS uint64
 	var nextCPU float64
 	var nextNotProcessed int
 	var prevPPS uint64
 	var prevCPU float64
 	var prevNotProcessed int
-	var maxPPS uint64
-	var maxCPU float64
+	var bestPPS uint64
+	var bestCPU float64
 
 	oldRxQueueIndex := slices.Index(listRxQueue, config.RXQueue)
 	prevRxQueueIndex := oldRxQueueIndex - 1
 	nexRxQueueIndex := oldRxQueueIndex + 1
 
+	//gathers data for the different RXQueue sizes
 	if prevRxQueueIndex >= 0 {
 		config.RXQueue = listRxQueue[prevRxQueueIndex]
 		setConfig(ethHandle, config)
@@ -322,54 +325,63 @@ func changeRxQueue(ethHandle *ethtool.Ethtool, config Config, interval int, extD
 	// fmt.Printf("Old %d, Next %d, Prev %d, extern %d\n", old, next, prev, extDrop)
 
 	p := message.NewPrinter(language.English)
-	// li processa tutti cerca utilizzo cpu minore
-	if oldNotProcessed < DROPPED_THRESHOLD && prevNotProcessed < DROPPED_THRESHOLD && nextNotProcessed < DROPPED_THRESHOLD {
-		p.Printf("All processed, looking for lower CPU usage\n")
-		if prevCPU < nextCPU && prevCPU < oldCPU {
-			p.Printf("Lower Rxqueue %d is better by %d\n", listRxQueue[prevRxQueueIndex], prevCPU-oldCPU)
-			config.RXQueue = listRxQueue[prevRxQueueIndex]
-			setConfig(ethHandle, config)
-			maxPPS = prevPPS
-			maxCPU = prevCPU
-		} else if nextCPU < prevCPU && nextCPU < oldCPU {
-			p.Printf("Higher Rxqueue %d is better by %d \n", listRxQueue[nexRxQueueIndex], nextCPU-oldCPU)
-			config.RXQueue = listRxQueue[nexRxQueueIndex]
-			setConfig(ethHandle, config)
-			maxPPS = nextPPS
-			maxCPU = nextCPU
-		} else {
-			p.Printf("Current Rxqueue %d is better\n", listRxQueue[oldRxQueueIndex])
-			setConfig(ethHandle, config)
-			config.RXQueue = listRxQueue[oldRxQueueIndex]
-			maxPPS = oldPPS
-			maxCPU = oldCPU
-		}
-	} else { // non li processa tutti cerca throughput maggiore
-		p.Printf("Not all processed, looking for higher throughput\n")
-		// maggiore di quello non modificato e del massimo totale
-		if float64(prevPPS) > float64(nextPPS)*PPS_THRESHOLD && float64(prevPPS) > float64(oldPPS)*PPS_THRESHOLD && float64(prevPPS) > float64(extDrop)*PPS_THRESHOLD {
-			p.Printf("Lower Rxqueue %d is better by %d\n", listRxQueue[prevRxQueueIndex], prevPPS-oldPPS)
-			config.RXQueue = listRxQueue[prevRxQueueIndex]
-			setConfig(ethHandle, config)
-			maxPPS = prevPPS
-			maxCPU = prevCPU
-		} else if float64(nextPPS) > float64(prevPPS)*PPS_THRESHOLD && float64(nextPPS) > float64(oldPPS)*PPS_THRESHOLD && float64(nextPPS) > float64(extDrop)*PPS_THRESHOLD {
-			p.Printf("Higher Rxqueue %d is better by %d \n", listRxQueue[nexRxQueueIndex], nextPPS-oldPPS)
-			config.RXQueue = listRxQueue[nexRxQueueIndex]
-			setConfig(ethHandle, config)
-			maxPPS = nextPPS
-			maxCPU = nextCPU
-		} else {
-			p.Printf("Current Rxqueue %d is better\n", listRxQueue[oldRxQueueIndex])
-			setConfig(ethHandle, config)
-			config.RXQueue = listRxQueue[oldRxQueueIndex]
-			maxPPS = oldPPS
-			maxCPU = oldCPU
-
-		}
+	type candidate struct {
+		rxQueueIndex int
+		pps          uint64
+		cpu          float64
+		name         string
 	}
 
-	return config, maxPPS, maxCPU
+	var candidates []candidate
+
+	// Raccogli solo le configurazioni che processano tutto
+	if oldNotProcessed < DROPPED_THRESHOLD {
+		candidates = append(candidates, candidate{oldRxQueueIndex, oldPPS, oldCPU, "Old"})
+	}
+	if prevNotProcessed < DROPPED_THRESHOLD {
+		candidates = append(candidates, candidate{prevRxQueueIndex, prevPPS, prevCPU, "Prev"})
+	}
+	if nextNotProcessed < DROPPED_THRESHOLD {
+		candidates = append(candidates, candidate{nexRxQueueIndex, nextPPS, nextCPU, "Next"})
+	}
+
+	if len(candidates) > 0 {
+		// Scegli quella con minore CPU usage
+		best := candidates[0]
+		for _, c := range candidates[1:] {
+			if c.cpu < best.cpu {
+				best = c
+			}
+		}
+		p.Printf("%s RXQueue %d is best (CPU=%f) by (CPU=%f) \n", best.name, listRxQueue[best.rxQueueIndex], best.cpu, oldCPU-best.cpu)
+		// p.Printf("%s RXQueue %d is best (CPU=%f) (PPS=%d) by (CPU=%f) (PPS=%d) \n", best.name, listRxQueue[best.rxQueueIndex], best.cpu, best.pps, oldCPU-best.cpu, int(best.pps)-int(oldPPS))
+		config.RXQueue = listRxQueue[best.rxQueueIndex]
+		setConfig(ethHandle, config)
+		bestPPS = best.pps
+		bestCPU = best.cpu
+	} else {
+		// Nessuna configurazione processa tutto -> massimizza il throughput
+		p.Printf("Not all processed, looking for higher throughput\n")
+		if float64(prevPPS) > float64(nextPPS)*PPS_THRESHOLD && float64(prevPPS) > float64(oldPPS)*PPS_THRESHOLD && float64(prevPPS) > float64(extDrop)*PPS_THRESHOLD {
+			p.Printf("Lower RXQueue %d is better by (PPS=%d)\n", listRxQueue[prevRxQueueIndex], prevPPS-oldPPS)
+			config.RXQueue = listRxQueue[prevRxQueueIndex]
+			bestPPS = prevPPS
+			bestCPU = prevCPU
+		} else if float64(nextPPS) > float64(prevPPS)*PPS_THRESHOLD && float64(nextPPS) > float64(oldPPS)*PPS_THRESHOLD && float64(nextPPS) > float64(extDrop)*PPS_THRESHOLD {
+			p.Printf("Higher RXQueue %d is better by (PPS=%d)\n", listRxQueue[nexRxQueueIndex], nextPPS-oldPPS)
+			config.RXQueue = listRxQueue[nexRxQueueIndex]
+			bestPPS = nextPPS
+			bestCPU = nextCPU
+		} else {
+			p.Printf("Current RXQueue %d is better\n", listRxQueue[oldRxQueueIndex])
+			config.RXQueue = listRxQueue[oldRxQueueIndex]
+			bestPPS = oldPPS
+			bestCPU = oldCPU
+		}
+		setConfig(ethHandle, config)
+	}
+
+	return config, bestPPS, bestCPU
 
 }
 
@@ -378,9 +390,11 @@ test and update the current RX budget size if there is a gain in throughput
 */
 func changeRxBudget(ethHandle *ethtool.Ethtool, config Config, interval int, extDrop uint64) (Config, uint64, float64) {
 	var listBudget = []uint32{2, 4, 8, 16, 32, 64, 128, 256, 512}
+
 	oldPPS := getAction(ethHandle, config.Iface, interval, config.Action)
 	oldCPU := getAverageCPUPercentage(config.Weight)
 	oldNotProcessed := getNotProcessed(ethHandle, config.Iface, interval, config.Action)
+
 	var nextPPS uint64
 	var nextCPU float64
 	var nextNotProcessed int
@@ -394,6 +408,7 @@ func changeRxBudget(ethHandle *ethtool.Ethtool, config Config, interval int, ext
 	prevBudgetIndex := oldBudgetIndex - 1
 	nexBudgetIndex := oldBudgetIndex + 1
 
+	//gathers data for the different budget values
 	if prevBudgetIndex > 0 {
 		config.Budget = listBudget[prevBudgetIndex]
 		setConfig(ethHandle, config)
@@ -411,48 +426,57 @@ func changeRxBudget(ethHandle *ethtool.Ethtool, config Config, interval int, ext
 	p := message.NewPrinter(language.English)
 	// fmt.Printf("Old %d, Next %d, Prev %d, extern %d\n", old, next, prev, extDrop)
 
-	if oldNotProcessed < DROPPED_THRESHOLD && prevNotProcessed < DROPPED_THRESHOLD && nextNotProcessed < DROPPED_THRESHOLD {
-		p.Printf("All processed, looking for lower CPU usage\n")
-		if prevCPU < nextCPU && prevCPU < oldCPU {
-			p.Printf("Lower Budget %d is better by %d\n", listBudget[prevBudgetIndex], prevCPU-oldCPU)
-			config.Budget = listBudget[prevBudgetIndex]
-			setConfig(ethHandle, config)
-			bestPPS = prevPPS
-			bestCPU = prevCPU
-		} else if nextCPU < prevCPU && nextCPU < oldCPU {
-			p.Printf("Higher Budget %d is better by %d \n", listBudget[nexBudgetIndex], nextCPU-oldCPU)
-			config.Budget = listBudget[nexBudgetIndex]
-			setConfig(ethHandle, config)
-			bestPPS = nextPPS
-			bestCPU = nextCPU
-		} else {
-			p.Printf("Current Budget %d is better\n", listBudget[oldBudgetIndex])
-			setConfig(ethHandle, config)
-			config.Budget = listBudget[oldBudgetIndex]
-			bestPPS = oldPPS
-			bestCPU = oldCPU
+	type candidate struct {
+		budgetIndex int
+		pps         uint64
+		cpu         float64
+		name        string
+	}
+	var candidates []candidate
+	// Raccogli solo le configurazioni che processano tutto
+	if oldNotProcessed < DROPPED_THRESHOLD {
+		candidates = append(candidates, candidate{oldBudgetIndex, oldPPS, oldCPU, "Old"})
+	}
+	if prevNotProcessed < DROPPED_THRESHOLD {
+		candidates = append(candidates, candidate{prevBudgetIndex, prevPPS, prevCPU, "Prev"})
+	}
+	if nextNotProcessed < DROPPED_THRESHOLD {
+		candidates = append(candidates, candidate{nexBudgetIndex, nextPPS, nextCPU, "Next"})
+	}
+	if len(candidates) > 0 {
+		// Scegli quella con minore CPU usage
+		best := candidates[0]
+		for _, c := range candidates[1:] {
+			if c.cpu < best.cpu {
+				best = c
+			}
 		}
-	} else { // non li processa tutti cerca throughput maggiore
+		p.Printf("%s Budget %d is best (CPU=%f) by (CPU=%f) \n", best.name, listBudget[best.budgetIndex], best.cpu, oldCPU-best.cpu)
+		// p.Printf("%s Budget %d is best (CPU=%f) (PPS=%d) by (CPU=%f) (PPS=%d) \n", best.name, listBudget[best.budgetIndex], best.cpu, best.pps, oldCPU-best.cpu, int(best.pps)-int(oldPPS))
+		config.Budget = listBudget[best.budgetIndex]
+		setConfig(ethHandle, config)
+		bestPPS = best.pps
+		bestCPU = best.cpu
+	} else {
+		// Nessuna configurazione processa tutto -> massimizza il throughput
 		p.Printf("Not all processed, looking for higher throughput\n")
 		if float64(prevPPS) > float64(nextPPS)*PPS_THRESHOLD && float64(prevPPS) > float64(oldPPS)*PPS_THRESHOLD && float64(prevPPS) > float64(extDrop)*PPS_THRESHOLD {
-			p.Printf("Lower Budget %d is better by %d\n", listBudget[prevBudgetIndex], prevPPS-oldPPS)
+			p.Printf("Lower Budget %d is better by (PPS=%d)\n", listBudget[prevBudgetIndex], prevPPS-oldPPS)
 			config.Budget = listBudget[prevBudgetIndex]
-			setConfig(ethHandle, config)
 			bestPPS = prevPPS
 			bestCPU = prevCPU
 		} else if float64(nextPPS) > float64(prevPPS)*PPS_THRESHOLD && float64(nextPPS) > float64(oldPPS)*PPS_THRESHOLD && float64(nextPPS) > float64(extDrop)*PPS_THRESHOLD {
-			p.Printf("Higher Budget %d is better by %d\n", listBudget[nexBudgetIndex], nextPPS-oldPPS)
+			p.Printf("Higher Budget %d is better by (PPS=%d)\n", listBudget[nexBudgetIndex], nextPPS-oldPPS)
 			config.Budget = listBudget[nexBudgetIndex]
-			setConfig(ethHandle, config)
 			bestPPS = nextPPS
 			bestCPU = nextCPU
 		} else {
 			p.Printf("Current Budget %d is better\n", listBudget[oldBudgetIndex])
 			config.Budget = listBudget[oldBudgetIndex]
-			setConfig(ethHandle, config)
 			bestPPS = oldPPS
 			bestCPU = oldCPU
 		}
+		setConfig(ethHandle, config)
 	}
 	return config, bestPPS, bestCPU
 }
@@ -465,6 +489,7 @@ func changeCqeCompress(ethHandle *ethtool.Ethtool, config Config, interval int, 
 
 	oldCQECompress := config.CQECompress
 	newCQECompress := !oldCQECompress
+
 	var bestPPS uint64
 	var bestCPU float64
 
@@ -476,32 +501,51 @@ func changeCqeCompress(ethHandle *ethtool.Ethtool, config Config, interval int, 
 	newNotProcessed := getNotProcessed(ethHandle, config.Iface, interval, config.Action)
 	p := message.NewPrinter(language.English)
 
-	if oldNotProcessed < DROPPED_THRESHOLD && newNotProcessed < DROPPED_THRESHOLD {
-		p.Printf("All processed, looking for lower CPU usage\n")
-		if newCPU < oldCPU {
-			p.Printf("New Cqe Compression %t is better by %d\n", newCQECompress, newCPU-oldCPU)
-			bestPPS = newPPS
-			bestCPU = newCPU
-		} else {
-			p.Printf("Previous Cqe Compression %t was better by %d, reverting \n", oldCQECompress, oldCPU-newCPU)
-			config.CQECompress = oldCQECompress
-			setConfig(ethHandle, config)
-			bestPPS = oldPPS
-			bestCPU = oldCPU
+	type candidate struct {
+		cqeCompress bool
+		pps         uint64
+		cpu         float64
+		name        string
+	}
+
+	var candidates []candidate
+
+	// Considera solo quelle che processano tutto
+	if oldNotProcessed < DROPPED_THRESHOLD {
+		candidates = append(candidates, candidate{oldCQECompress, oldPPS, oldCPU, "Old"})
+	}
+	if newNotProcessed < DROPPED_THRESHOLD {
+		candidates = append(candidates, candidate{newCQECompress, newPPS, newCPU, "New"})
+	}
+
+	if len(candidates) > 0 {
+		// Tra quelle valide, scegli la meno pesante in termini di CPU
+		best := candidates[0]
+		for _, c := range candidates[1:] {
+			if c.cpu < best.cpu {
+				best = c
+			}
 		}
+		p.Printf("%s CQE Compression %t is best (CPU=%f) by (CPU=%f)\n", best.name, best.cqeCompress, best.cpu, oldCPU-best.cpu)
+		config.CQECompress = best.cqeCompress
+		setConfig(ethHandle, config)
+		bestPPS = best.pps
+		bestCPU = best.cpu
 	} else {
+		// Nessuna delle due processa tutto → massimizza il throughput
 		p.Printf("Not all processed, looking for higher throughput\n")
 		if float64(newPPS) > float64(oldPPS)*PPS_THRESHOLD && float64(newPPS) > float64(extDrop)*PPS_THRESHOLD {
-			p.Printf("New Cqe Compression %t is better by %d\n", newCQECompress, newPPS-oldPPS)
+			p.Printf("New CQE Compression %t is better by (PPS=%d)\n", newCQECompress, newPPS-oldPPS)
+			config.CQECompress = newCQECompress
 			bestPPS = newPPS
 			bestCPU = newCPU
 		} else {
-			p.Printf("Previous Cqe Compression %t was better by %d, reverting\n", oldCQECompress, oldPPS-newPPS)
+			p.Printf("Previous CQE Compression %t was better by (PPS=%d), reverting\n", oldCQECompress, oldPPS-newPPS)
 			config.CQECompress = oldCQECompress
-			setConfig(ethHandle, config)
 			bestPPS = oldPPS
 			bestCPU = oldCPU
 		}
+		setConfig(ethHandle, config)
 	}
 	return config, bestPPS, bestCPU
 }
@@ -524,33 +568,53 @@ func changeRxStriding(ethHandle *ethtool.Ethtool, config Config, interval int, e
 	newCPU := getAverageCPUPercentage(config.Weight)
 	newNotProcessed := getNotProcessed(ethHandle, config.Iface, interval, config.Action)
 	p := message.NewPrinter(language.English)
-	if oldNotProcessed < DROPPED_THRESHOLD && newNotProcessed < DROPPED_THRESHOLD {
-		p.Printf("All processed, looking for lower CPU usage\n")
-		if newCPU < oldCPU {
-			p.Printf("New Rx striding %t is better by %d\n", newRxStriding, newCPU-oldCPU)
-			bestPPS = newPPS
-			bestCPU = newCPU
-		} else {
-			p.Printf("Previous Rx striding %t was better by %d, reverting\n", oldRxStriding, oldCPU-newCPU)
-			config.Striding = oldRxStriding
-			setConfig(ethHandle, config)
-			bestPPS = oldPPS
-			bestCPU = oldCPU
+	type candidate struct {
+		rxStriding bool
+		pps        uint64
+		cpu        float64
+		name       string
+	}
+
+	var candidates []candidate
+
+	// Considera solo le configurazioni che processano tutto
+	if oldNotProcessed < DROPPED_THRESHOLD {
+		candidates = append(candidates, candidate{oldRxStriding, oldPPS, oldCPU, "Old"})
+	}
+	if newNotProcessed < DROPPED_THRESHOLD {
+		candidates = append(candidates, candidate{newRxStriding, newPPS, newCPU, "New"})
+	}
+
+	if len(candidates) > 0 {
+		// Tra le valide, scegli quella con minore utilizzo CPU
+		best := candidates[0]
+		for _, c := range candidates[1:] {
+			if c.cpu < best.cpu {
+				best = c
+			}
 		}
+		p.Printf("%s Rx Striding %t is best (CPU=%f) by (CPU=%f)\n", best.name, best.rxStriding, best.cpu, oldCPU-best.cpu)
+		config.Striding = best.rxStriding
+		setConfig(ethHandle, config)
+		bestPPS = best.pps
+		bestCPU = best.cpu
 	} else {
+		// Nessuna processa tutto → confronto throughput
 		p.Printf("Not all processed, looking for higher throughput\n")
 		if float64(newPPS) > float64(oldPPS)*PPS_THRESHOLD && float64(newPPS) > float64(extDrop)*PPS_THRESHOLD {
-			p.Printf("New Rx striding %t is better by %d\n", newRxStriding, newPPS-oldPPS)
+			p.Printf("New Rx Striding %t is better by (PPS=%d)\n", newRxStriding, newPPS-oldPPS)
+			config.Striding = newRxStriding
 			bestPPS = newPPS
 			bestCPU = newCPU
 		} else {
-			p.Printf("Previous Rx striding %t was better by %d, reverting\n", oldRxStriding, oldPPS-newPPS)
+			p.Printf("Previous Rx Striding %t was better by (PPS=%d), reverting\n", oldRxStriding, oldPPS-newPPS)
 			config.Striding = oldRxStriding
-			setConfig(ethHandle, config)
 			bestPPS = oldPPS
 			bestCPU = oldCPU
 		}
+		setConfig(ethHandle, config)
 	}
+
 	return config, bestPPS, bestCPU
 }
 
@@ -578,36 +642,54 @@ func changeWRMSR(ethHandle *ethtool.Ethtool, config Config, interval int, extDro
 	newNotProcessed := getNotProcessed(ethHandle, config.Iface, interval, config.Action)
 	p := message.NewPrinter(language.English)
 
-	if oldNotProcessed < DROPPED_THRESHOLD && newNotProcessed < DROPPED_THRESHOLD {
-		p.Printf("All processed, looking for lower CPU usage\n")
-		if newCPU < oldCPU {
-			p.Printf("New MSR %x is better by %d\n", newMSRval, newCPU-oldCPU)
-			config.MSRValue = newMSRval
-			bestPPS = newPPS
-			bestCPU = newCPU
-		} else {
-			p.Printf("Previous MSR %x was better by %d, reverting\n", oldMSRval, oldCPU-newCPU)
-			config.MSRValue = oldMSRval
-			setMSR(oldMSRval)
-			bestPPS = oldPPS
-			bestCPU = oldCPU
-		}
-	} else { // non li processa tutti cerca throughput maggiore
-		p.Printf("Not all processed, looking for higher throughput\n")
+	type candidate struct {
+		msrValue uint64
+		pps      uint64
+		cpu      float64
+		name     string
+	}
 
+	var candidates []candidate
+
+	// Considera solo le configurazioni che processano tutto
+	if oldNotProcessed < DROPPED_THRESHOLD {
+		candidates = append(candidates, candidate{oldMSRval, oldPPS, oldCPU, "Old"})
+	}
+	if newNotProcessed < DROPPED_THRESHOLD {
+		candidates = append(candidates, candidate{newMSRval, newPPS, newCPU, "New"})
+	}
+
+	if len(candidates) > 0 {
+		// Tra quelle valide, scegli la meno pesante in termini di CPU
+		best := candidates[0]
+		for _, c := range candidates[1:] {
+			if c.cpu < best.cpu {
+				best = c
+			}
+		}
+		p.Printf("%s MSR %x is best (CPU=%f) by (CPU=%f)\n", best.name, best.msrValue, best.cpu, oldCPU-best.cpu)
+		config.MSRValue = best.msrValue
+		setMSR(best.msrValue)
+		bestPPS = best.pps
+		bestCPU = best.cpu
+	} else {
+		// Nessuna configurazione è completa → confronta il throughput
+		p.Printf("Not all processed, looking for higher throughput\n")
 		if float64(newPPS) > float64(oldPPS)*PPS_THRESHOLD && float64(newPPS) > float64(extDrop)*PPS_THRESHOLD {
-			p.Printf("New MSR %x is better by %d\n", newMSRval, newPPS-oldPPS)
+			p.Printf("New MSR %x is better by (PPS=%d)\n", newMSRval, newPPS-oldPPS)
 			config.MSRValue = newMSRval
+			setMSR(newMSRval)
 			bestPPS = newPPS
 			bestCPU = newCPU
 		} else {
-			p.Printf("Prevous MSR %x was better by %d, reverting\n", oldMSRval, oldPPS-newPPS)
+			p.Printf("Previous MSR %x was better by (PPS=%d), reverting\n", oldMSRval, oldPPS-newPPS)
 			config.MSRValue = oldMSRval
 			setMSR(oldMSRval)
 			bestPPS = oldPPS
 			bestCPU = oldCPU
 		}
 	}
+
 	return config, bestPPS, bestCPU
 
 }
