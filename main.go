@@ -14,25 +14,30 @@ import (
 	"github.com/VladimiroPaschali/ethtool-indir"
 	"github.com/cilium/ebpf/link"
 	"github.com/shirou/gopsutil/v3/cpu"
+	"github.com/u-root/u-root/pkg/msr"
 
 	"golang.org/x/text/language"
 	"golang.org/x/text/message"
 )
 
-var globalThreshold float64 = 1.0
-
+// var PPS_THRESHOLD float64 = 1.0001 // 7 mila su 7 milioni
+const PPS_THRESHOLD float64 = 1 // 7 mila su 7 milioni
+const DROPPED_THRESHOLD = 100
 const MAX_CORES = 32
 const MAX_INDIR_SIZE = 256
 const INTERVAL = 5
 
 type Config struct {
 	Iface       string
+	Action      string
 	Budget      uint32
 	RXQueue     uint32
 	CQECompress bool
 	Striding    bool
 	Weight      [MAX_CORES]uint32
 	Cores       uint32
+	MSR         uint32
+	MSRValue    uint64
 }
 
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -tags linux bpf cms.bpf.c
@@ -51,7 +56,7 @@ func setRing(ethHandle *ethtool.Ethtool, iface string, ring ethtool.Ring) ethtoo
 	if err != nil {
 		panic(err.Error())
 	}
-	fmt.Printf("Ring RxPending: %v, TxPending: %v\n", ring.RxPending, ring.TxPending)
+	// fmt.Printf("Ring RxPending: %v, TxPending: %v\n", ring.RxPending, ring.TxPending)
 	return ring
 }
 
@@ -77,6 +82,16 @@ func setConfig(ethHandle *ethtool.Ethtool, config Config) {
 	ring = setRing(ethHandle, config.Iface, ring)
 
 }
+func setMSR(val uint64) {
+	c, err := msr.AllCPUs()
+	if err != nil {
+		panic(err)
+	}
+	var r msr.MSR = 0xc8b
+	r.Write(c, val)
+	// fmt.Printf("Set MSR to %x\n", val)
+
+}
 
 func getIndir(ethHandle *ethtool.Ethtool, iface string) [256]uint32 {
 	indir, err := ethHandle.GetIndir(iface)
@@ -88,8 +103,7 @@ func getIndir(ethHandle *ethtool.Ethtool, iface string) [256]uint32 {
 
 func setIndir(ethHandle *ethtool.Ethtool, config Config) {
 	setindir := ethtool.SetIndir{}
-	setindir.Weight = config.Weight
-
+	setindir.Weight = config.Weight[:]
 	_, err := ethHandle.SetIndir(config.Iface, setindir)
 	if err != nil {
 		panic(err.Error())
@@ -103,7 +117,22 @@ func overrideIndir(ethHandle *ethtool.Ethtool, iface string, indir ethtool.SetIn
 	}
 }
 
-func getDrop(ethHandle *ethtool.Ethtool, iface string, seconds int) uint64 {
+func equalizeIndir(ethHandle *ethtool.Ethtool, config Config, minCPU uint32, maxCPU uint32) {
+	oldIndir := getIndir(ethHandle, config.Iface)
+	for index, value := range oldIndir {
+		// if value == maxCPU && index%2 == 0 {
+		if value == maxCPU && index%5 == 0 {
+
+			oldIndir[index] = minCPU
+		}
+	}
+	// variabile indir
+	newIndir := ethtool.SetIndir{}
+	newIndir.RingIndex = oldIndir
+	overrideIndir(ethHandle, config.Iface, newIndir)
+}
+
+func getAction(ethHandle *ethtool.Ethtool, iface string, seconds int, action string) uint64 {
 
 	var duration time.Duration = time.Duration(seconds) * time.Second
 
@@ -125,10 +154,42 @@ func getDrop(ethHandle *ethtool.Ethtool, iface string, seconds int) uint64 {
 	var tot uint64 = post - pre
 	var pps uint64 = tot / uint64(seconds)
 
-	p := message.NewPrinter(language.English)
-	p.Printf("Drop per second %d\n", pps)
+	// p := message.NewPrinter(language.English)
+	// p.Printf("Drop per second %d\n", pps)
 
 	return pps
+}
+
+func getNotProcessed(ethHandle *ethtool.Ethtool, iface string, seconds int, action string) int {
+	var duration time.Duration = time.Duration(seconds) * time.Second
+
+	stats, err := ethHandle.Stats(iface)
+	if err != nil {
+		panic(err.Error())
+	}
+	// fmt.Printf("rx_xdp_drop: %d\n", stats["rx_xdp_drop"])
+	var prePhy uint64 = stats["rx_packets_phy"]
+	var preAction uint64 = stats[action]
+
+	time.Sleep(duration)
+
+	stats, err = ethHandle.Stats(iface)
+	if err != nil {
+		panic(err.Error())
+	}
+	// fmt.Printf("rx_xdp_drop: %d\n", stats["rx_xdp_drop"])
+	var postPhy uint64 = stats["rx_packets_phy"]
+	var postAction uint64 = stats[action]
+	var totPhy uint64 = postPhy - prePhy
+	var totAction uint64 = postAction - preAction
+	var ppsPhy uint64 = totPhy / uint64(seconds)
+	var ppsAction uint64 = totAction / uint64(seconds)
+	var pps uint64 = ppsPhy - ppsAction
+
+	p := message.NewPrinter(language.English)
+	p.Printf("Not Processed per second %d\n", int(pps))
+
+	return int(pps)
 }
 
 func createCSV() *csv.Writer {
@@ -139,7 +200,7 @@ func createCSV() *csv.Writer {
 
 	writer := csv.NewWriter(file)
 
-	err = writer.Write([]string{"budget", "rxqueue", "rx_cqe_compress", "rx_striding_rq", "rx_xdp_drop", "cpu", "core_count", "time"})
+	err = writer.Write([]string{"budget", "rxqueue", "rx_cqe_compress", "rx_striding_rq", "rx_xdp_drop", "msr", "cpu", "core_count", "time"})
 	if err != nil {
 		file.Close()
 		panic(err.Error())
@@ -150,12 +211,12 @@ func createCSV() *csv.Writer {
 	return writer
 }
 
-func writeCSV(writer *csv.Writer, config Config, drop uint64, cpu int) {
+func writeCSV(writer *csv.Writer, config Config, drop uint64, cpu float64) {
 	now := time.Now()
 	p := message.NewPrinter(language.English)
-	p.Printf("budget: %d, rxqueue: %d, cqe_compress: %t, striding: %t, drop: %d, cpu: %d, core_count %d, time: %s\n", config.Budget, config.RXQueue, config.CQECompress, config.Striding, drop, cpu, config.Cores, now.Format("15:04:05"))
+	p.Printf("budget: %d, rxqueue: %d, cqe_compress: %t, striding: %t, drop: %d, msr: %x cpu: %f, core_count %d, time: %s\n", config.Budget, config.RXQueue, config.CQECompress, config.Striding, drop, config.MSRValue, cpu, config.Cores, now.Format("15:04:05"))
 
-	err := writer.Write([]string{fmt.Sprintf("%d", config.Budget), fmt.Sprintf("%d", config.RXQueue), fmt.Sprintf("%t", config.CQECompress), fmt.Sprintf("%t", config.Striding), fmt.Sprintf("%d", drop), fmt.Sprintf("%d", cpu), fmt.Sprintf("%d", config.Cores), now.Format("15:04:05")})
+	err := writer.Write([]string{fmt.Sprintf("%d", config.Budget), fmt.Sprintf("%d", config.RXQueue), fmt.Sprintf("%t", config.CQECompress), fmt.Sprintf("%t", config.Striding), fmt.Sprintf("%d", drop), fmt.Sprintf("%x", config.MSRValue), fmt.Sprintf("%f", cpu), fmt.Sprintf("%d", config.Cores), now.Format("15:04:05")})
 	if err != nil {
 		panic(err.Error())
 	}
@@ -200,7 +261,7 @@ func getCPUPercentage(core int) int {
 	return int(math.Round(percentages[core]))
 }
 
-func getAverageCPUPercentage(weight [MAX_CORES]uint32) int {
+func getAverageCPUPercentage(weight [MAX_CORES]uint32) float64 {
 	percentages, err := cpu.Percent(time.Second, true)
 	if err != nil {
 		panic(err.Error())
@@ -214,7 +275,8 @@ func getAverageCPUPercentage(weight [MAX_CORES]uint32) int {
 			numcores++
 		}
 	}
-	avg := int(math.Round(sum / float64(numcores)))
+	// avg := int(math.Round(sum / float64(numcores)))
+	avg := sum / float64(numcores)
 	// fmt.Printf("CPU usage: %v\n", percentages)
 	// fmt.Printf("Average CPU usage: %d\n", avg)
 	return avg
@@ -223,12 +285,19 @@ func getAverageCPUPercentage(weight [MAX_CORES]uint32) int {
 /*
 test and update the current RX Queue size if there is a gain in throughput
 */
-func changeRxQueue(ethHandle *ethtool.Ethtool, config Config, interval int, extDrop uint64) (Config, uint64) {
+func changeRxQueue(ethHandle *ethtool.Ethtool, config Config, interval int, extDrop uint64) (Config, uint64, float64) {
 	var listRxQueue = []uint32{128, 256, 512, 1024, 2048, 4096, 8192}
-	old := getDrop(ethHandle, config.Iface, interval)
-	var next uint64
-	var prev uint64
-	var maxDrop uint64
+	oldPPS := getAction(ethHandle, config.Iface, interval, config.Action)
+	oldCPU := getAverageCPUPercentage(config.Weight)
+	oldNotProcessed := getNotProcessed(ethHandle, config.Iface, interval, config.Action)
+	var nextPPS uint64
+	var nextCPU float64
+	var nextNotProcessed int
+	var prevPPS uint64
+	var prevCPU float64
+	var prevNotProcessed int
+	var maxPPS uint64
+	var maxCPU float64
 
 	oldRxQueueIndex := slices.Index(listRxQueue, config.RXQueue)
 	prevRxQueueIndex := oldRxQueueIndex - 1
@@ -237,49 +306,89 @@ func changeRxQueue(ethHandle *ethtool.Ethtool, config Config, interval int, extD
 	if prevRxQueueIndex >= 0 {
 		config.RXQueue = listRxQueue[prevRxQueueIndex]
 		setConfig(ethHandle, config)
-		prev = getDrop(ethHandle, config.Iface, interval)
+		prevPPS = getAction(ethHandle, config.Iface, interval, config.Action)
+		prevCPU = getAverageCPUPercentage(config.Weight)
+		prevNotProcessed = getNotProcessed(ethHandle, config.Iface, interval, config.Action)
 	}
 	if nexRxQueueIndex <= len(listRxQueue) {
 
 		config.RXQueue = listRxQueue[nexRxQueueIndex]
 		setConfig(ethHandle, config)
-		next = getDrop(ethHandle, config.Iface, interval)
+		nextPPS = getAction(ethHandle, config.Iface, interval, config.Action)
+		nextCPU = getAverageCPUPercentage(config.Weight)
+		nextNotProcessed = getNotProcessed(ethHandle, config.Iface, interval, config.Action)
 	}
 
-	fmt.Printf("Old %d, Next %d, Prev %d, extern %d\n", old, next, prev, extDrop)
+	// fmt.Printf("Old %d, Next %d, Prev %d, extern %d\n", old, next, prev, extDrop)
 
-	// maggiore di quello non modificato e del massimo totale
-	if float64(prev) > float64(next)*globalThreshold && float64(prev) > float64(old)*globalThreshold && float64(prev) > float64(extDrop)*globalThreshold {
-		fmt.Printf("Lower Rxqueue %d is better\n", listRxQueue[prevRxQueueIndex])
-		config.RXQueue = listRxQueue[prevRxQueueIndex]
-		setConfig(ethHandle, config)
-		maxDrop = prev
-	} else if float64(next) > float64(prev)*globalThreshold && float64(next) > float64(old)*globalThreshold && float64(next) > float64(extDrop)*globalThreshold {
-		fmt.Printf("Higher Rxqueue %d is better\n", listRxQueue[nexRxQueueIndex])
-		config.RXQueue = listRxQueue[nexRxQueueIndex]
-		setConfig(ethHandle, config)
-		maxDrop = next
-	} else {
-		fmt.Printf("Current Rxqueue %d is better\n", listRxQueue[oldRxQueueIndex])
-		setConfig(ethHandle, config)
-		config.RXQueue = listRxQueue[oldRxQueueIndex]
-		maxDrop = old
+	p := message.NewPrinter(language.English)
+	// li processa tutti cerca utilizzo cpu minore
+	if oldNotProcessed < DROPPED_THRESHOLD && prevNotProcessed < DROPPED_THRESHOLD && nextNotProcessed < DROPPED_THRESHOLD {
+		p.Printf("All processed, looking for lower CPU usage\n")
+		if prevCPU < nextCPU && prevCPU < oldCPU {
+			p.Printf("Lower Rxqueue %d is better by %d\n", listRxQueue[prevRxQueueIndex], prevCPU-oldCPU)
+			config.RXQueue = listRxQueue[prevRxQueueIndex]
+			setConfig(ethHandle, config)
+			maxPPS = prevPPS
+			maxCPU = prevCPU
+		} else if nextCPU < prevCPU && nextCPU < oldCPU {
+			p.Printf("Higher Rxqueue %d is better by %d \n", listRxQueue[nexRxQueueIndex], nextCPU-oldCPU)
+			config.RXQueue = listRxQueue[nexRxQueueIndex]
+			setConfig(ethHandle, config)
+			maxPPS = nextPPS
+			maxCPU = nextCPU
+		} else {
+			p.Printf("Current Rxqueue %d is better\n", listRxQueue[oldRxQueueIndex])
+			setConfig(ethHandle, config)
+			config.RXQueue = listRxQueue[oldRxQueueIndex]
+			maxPPS = oldPPS
+			maxCPU = oldCPU
+		}
+	} else { // non li processa tutti cerca throughput maggiore
+		p.Printf("Not all processed, looking for higher throughput\n")
+		// maggiore di quello non modificato e del massimo totale
+		if float64(prevPPS) > float64(nextPPS)*PPS_THRESHOLD && float64(prevPPS) > float64(oldPPS)*PPS_THRESHOLD && float64(prevPPS) > float64(extDrop)*PPS_THRESHOLD {
+			p.Printf("Lower Rxqueue %d is better by %d\n", listRxQueue[prevRxQueueIndex], prevPPS-oldPPS)
+			config.RXQueue = listRxQueue[prevRxQueueIndex]
+			setConfig(ethHandle, config)
+			maxPPS = prevPPS
+			maxCPU = prevCPU
+		} else if float64(nextPPS) > float64(prevPPS)*PPS_THRESHOLD && float64(nextPPS) > float64(oldPPS)*PPS_THRESHOLD && float64(nextPPS) > float64(extDrop)*PPS_THRESHOLD {
+			p.Printf("Higher Rxqueue %d is better by %d \n", listRxQueue[nexRxQueueIndex], nextPPS-oldPPS)
+			config.RXQueue = listRxQueue[nexRxQueueIndex]
+			setConfig(ethHandle, config)
+			maxPPS = nextPPS
+			maxCPU = nextCPU
+		} else {
+			p.Printf("Current Rxqueue %d is better\n", listRxQueue[oldRxQueueIndex])
+			setConfig(ethHandle, config)
+			config.RXQueue = listRxQueue[oldRxQueueIndex]
+			maxPPS = oldPPS
+			maxCPU = oldCPU
 
+		}
 	}
 
-	return config, maxDrop
+	return config, maxPPS, maxCPU
 
 }
 
 /*
 test and update the current RX budget size if there is a gain in throughput
 */
-func changeRxBudget(ethHandle *ethtool.Ethtool, config Config, interval int, extDrop uint64) (Config, uint64) {
+func changeRxBudget(ethHandle *ethtool.Ethtool, config Config, interval int, extDrop uint64) (Config, uint64, float64) {
 	var listBudget = []uint32{2, 4, 8, 16, 32, 64, 128, 256, 512}
-	old := getDrop(ethHandle, config.Iface, interval)
-	var next uint64
-	var prev uint64
-	var maxDrop uint64
+	oldPPS := getAction(ethHandle, config.Iface, interval, config.Action)
+	oldCPU := getAverageCPUPercentage(config.Weight)
+	oldNotProcessed := getNotProcessed(ethHandle, config.Iface, interval, config.Action)
+	var nextPPS uint64
+	var nextCPU float64
+	var nextNotProcessed int
+	var prevPPS uint64
+	var prevCPU float64
+	var prevNotProcessed int
+	var bestPPS uint64
+	var bestCPU float64
 
 	oldBudgetIndex := slices.Index(listBudget, config.Budget)
 	prevBudgetIndex := oldBudgetIndex - 1
@@ -288,81 +397,219 @@ func changeRxBudget(ethHandle *ethtool.Ethtool, config Config, interval int, ext
 	if prevBudgetIndex > 0 {
 		config.Budget = listBudget[prevBudgetIndex]
 		setConfig(ethHandle, config)
-		prev = getDrop(ethHandle, config.Iface, interval)
+		prevPPS = getAction(ethHandle, config.Iface, interval, config.Action)
+		prevCPU = getAverageCPUPercentage(config.Weight)
+		prevNotProcessed = getNotProcessed(ethHandle, config.Iface, interval, config.Action)
 	}
 	if nexBudgetIndex < len(listBudget) {
 		config.Budget = listBudget[nexBudgetIndex]
 		setConfig(ethHandle, config)
-		next = getDrop(ethHandle, config.Iface, interval)
+		nextPPS = getAction(ethHandle, config.Iface, interval, config.Action)
+		nextCPU = getAverageCPUPercentage(config.Weight)
+		nextNotProcessed = getNotProcessed(ethHandle, config.Iface, interval, config.Action)
 	}
+	p := message.NewPrinter(language.English)
+	// fmt.Printf("Old %d, Next %d, Prev %d, extern %d\n", old, next, prev, extDrop)
 
-	fmt.Printf("Old %d, Next %d, Prev %d, extern %d\n", old, next, prev, extDrop)
-
-	if float64(prev) > float64(next)*globalThreshold && float64(prev) > float64(old)*globalThreshold && float64(prev) > float64(extDrop)*globalThreshold {
-		fmt.Printf("Lower Budget %d is better\n", listBudget[prevBudgetIndex])
-		config.Budget = listBudget[prevBudgetIndex]
-		setConfig(ethHandle, config)
-		maxDrop = prev
-	} else if float64(next) > float64(prev)*globalThreshold && float64(next) > float64(old)*globalThreshold && float64(next) > float64(extDrop)*globalThreshold {
-		fmt.Printf("Higher Budget %d is better\n", listBudget[nexBudgetIndex])
-		config.Budget = listBudget[nexBudgetIndex]
-		setConfig(ethHandle, config)
-		maxDrop = next
-	} else {
-		fmt.Printf("Current Budget %d is better\n", listBudget[oldBudgetIndex])
-		config.Budget = listBudget[oldBudgetIndex]
-		setConfig(ethHandle, config)
-		maxDrop = old
+	if oldNotProcessed < DROPPED_THRESHOLD && prevNotProcessed < DROPPED_THRESHOLD && nextNotProcessed < DROPPED_THRESHOLD {
+		p.Printf("All processed, looking for lower CPU usage\n")
+		if prevCPU < nextCPU && prevCPU < oldCPU {
+			p.Printf("Lower Budget %d is better by %d\n", listBudget[prevBudgetIndex], prevCPU-oldCPU)
+			config.Budget = listBudget[prevBudgetIndex]
+			setConfig(ethHandle, config)
+			bestPPS = prevPPS
+			bestCPU = prevCPU
+		} else if nextCPU < prevCPU && nextCPU < oldCPU {
+			p.Printf("Higher Budget %d is better by %d \n", listBudget[nexBudgetIndex], nextCPU-oldCPU)
+			config.Budget = listBudget[nexBudgetIndex]
+			setConfig(ethHandle, config)
+			bestPPS = nextPPS
+			bestCPU = nextCPU
+		} else {
+			p.Printf("Current Budget %d is better\n", listBudget[oldBudgetIndex])
+			setConfig(ethHandle, config)
+			config.Budget = listBudget[oldBudgetIndex]
+			bestPPS = oldPPS
+			bestCPU = oldCPU
+		}
+	} else { // non li processa tutti cerca throughput maggiore
+		p.Printf("Not all processed, looking for higher throughput\n")
+		if float64(prevPPS) > float64(nextPPS)*PPS_THRESHOLD && float64(prevPPS) > float64(oldPPS)*PPS_THRESHOLD && float64(prevPPS) > float64(extDrop)*PPS_THRESHOLD {
+			p.Printf("Lower Budget %d is better by %d\n", listBudget[prevBudgetIndex], prevPPS-oldPPS)
+			config.Budget = listBudget[prevBudgetIndex]
+			setConfig(ethHandle, config)
+			bestPPS = prevPPS
+			bestCPU = prevCPU
+		} else if float64(nextPPS) > float64(prevPPS)*PPS_THRESHOLD && float64(nextPPS) > float64(oldPPS)*PPS_THRESHOLD && float64(nextPPS) > float64(extDrop)*PPS_THRESHOLD {
+			p.Printf("Higher Budget %d is better by %d\n", listBudget[nexBudgetIndex], nextPPS-oldPPS)
+			config.Budget = listBudget[nexBudgetIndex]
+			setConfig(ethHandle, config)
+			bestPPS = nextPPS
+			bestCPU = nextCPU
+		} else {
+			p.Printf("Current Budget %d is better\n", listBudget[oldBudgetIndex])
+			config.Budget = listBudget[oldBudgetIndex]
+			setConfig(ethHandle, config)
+			bestPPS = oldPPS
+			bestCPU = oldCPU
+		}
 	}
-	return config, maxDrop
+	return config, bestPPS, bestCPU
 }
 
-func changeCqeCompress(ethHandle *ethtool.Ethtool, config Config, interval int, extDrop uint64) (Config, uint64) {
+func changeCqeCompress(ethHandle *ethtool.Ethtool, config Config, interval int, extDrop uint64) (Config, uint64, float64) {
 
-	old := getDrop(ethHandle, config.Iface, interval)
+	oldPPS := getAction(ethHandle, config.Iface, interval, config.Action)
+	oldCPU := getAverageCPUPercentage(config.Weight)
+	oldNotProcessed := getNotProcessed(ethHandle, config.Iface, interval, config.Action)
 
 	oldCQECompress := config.CQECompress
 	newCQECompress := !oldCQECompress
-	var maxDrop uint64
+	var bestPPS uint64
+	var bestCPU float64
 
 	config.CQECompress = newCQECompress
 	setConfig(ethHandle, config)
 
-	new := getDrop(ethHandle, config.Iface, interval)
-	if float64(new) > float64(old)*globalThreshold && float64(new) > float64(extDrop)*globalThreshold {
-		fmt.Printf("New Cqe Compression %t more than prevoius\n", newCQECompress)
-		maxDrop = new
+	newPPS := getAction(ethHandle, config.Iface, interval, config.Action)
+	newCPU := getAverageCPUPercentage(config.Weight)
+	newNotProcessed := getNotProcessed(ethHandle, config.Iface, interval, config.Action)
+	p := message.NewPrinter(language.English)
+
+	if oldNotProcessed < DROPPED_THRESHOLD && newNotProcessed < DROPPED_THRESHOLD {
+		p.Printf("All processed, looking for lower CPU usage\n")
+		if newCPU < oldCPU {
+			p.Printf("New Cqe Compression %t is better by %d\n", newCQECompress, newCPU-oldCPU)
+			bestPPS = newPPS
+			bestCPU = newCPU
+		} else {
+			p.Printf("Previous Cqe Compression %t was better by %d, reverting \n", oldCQECompress, oldCPU-newCPU)
+			config.CQECompress = oldCQECompress
+			setConfig(ethHandle, config)
+			bestPPS = oldPPS
+			bestCPU = oldCPU
+		}
 	} else {
-		fmt.Printf("Previous Cqe Compression %t less than prevoius reverting\n", oldCQECompress)
-		config.CQECompress = oldCQECompress
-		setConfig(ethHandle, config)
-		maxDrop = old
+		p.Printf("Not all processed, looking for higher throughput\n")
+		if float64(newPPS) > float64(oldPPS)*PPS_THRESHOLD && float64(newPPS) > float64(extDrop)*PPS_THRESHOLD {
+			p.Printf("New Cqe Compression %t is better by %d\n", newCQECompress, newPPS-oldPPS)
+			bestPPS = newPPS
+			bestCPU = newCPU
+		} else {
+			p.Printf("Previous Cqe Compression %t was better by %d, reverting\n", oldCQECompress, oldPPS-newPPS)
+			config.CQECompress = oldCQECompress
+			setConfig(ethHandle, config)
+			bestPPS = oldPPS
+			bestCPU = oldCPU
+		}
 	}
-	return config, maxDrop
+	return config, bestPPS, bestCPU
 }
 
-func changeRxStriding(ethHandle *ethtool.Ethtool, config Config, interval int, extDrop uint64) (Config, uint64) {
+func changeRxStriding(ethHandle *ethtool.Ethtool, config Config, interval int, extDrop uint64) (Config, uint64, float64) {
 
-	old := getDrop(ethHandle, config.Iface, interval)
+	oldPPS := getAction(ethHandle, config.Iface, interval, config.Action)
+	oldCPU := getAverageCPUPercentage(config.Weight)
+	oldNotProcessed := getNotProcessed(ethHandle, config.Iface, interval, config.Action)
 
 	oldRxStriding := config.Striding
 	newRxStriding := !oldRxStriding
-	var maxDrop uint64
+	var bestPPS uint64
+	var bestCPU float64
 
 	config.Striding = newRxStriding
 	setConfig(ethHandle, config)
 
-	new := getDrop(ethHandle, config.Iface, interval)
-	if float64(new) > float64(old)*globalThreshold && float64(new) > float64(extDrop)*globalThreshold {
-		fmt.Printf("New Rx striding %t more than prevoius\n", newRxStriding)
-		maxDrop = new
+	newPPS := getAction(ethHandle, config.Iface, interval, config.Action)
+	newCPU := getAverageCPUPercentage(config.Weight)
+	newNotProcessed := getNotProcessed(ethHandle, config.Iface, interval, config.Action)
+	p := message.NewPrinter(language.English)
+	if oldNotProcessed < DROPPED_THRESHOLD && newNotProcessed < DROPPED_THRESHOLD {
+		p.Printf("All processed, looking for lower CPU usage\n")
+		if newCPU < oldCPU {
+			p.Printf("New Rx striding %t is better by %d\n", newRxStriding, newCPU-oldCPU)
+			bestPPS = newPPS
+			bestCPU = newCPU
+		} else {
+			p.Printf("Previous Rx striding %t was better by %d, reverting\n", oldRxStriding, oldCPU-newCPU)
+			config.Striding = oldRxStriding
+			setConfig(ethHandle, config)
+			bestPPS = oldPPS
+			bestCPU = oldCPU
+		}
 	} else {
-		fmt.Printf("Prevous Rx striding %t less than prevoius reverting\n", oldRxStriding)
-		config.Striding = oldRxStriding
-		setConfig(ethHandle, config)
-		maxDrop = old
+		p.Printf("Not all processed, looking for higher throughput\n")
+		if float64(newPPS) > float64(oldPPS)*PPS_THRESHOLD && float64(newPPS) > float64(extDrop)*PPS_THRESHOLD {
+			p.Printf("New Rx striding %t is better by %d\n", newRxStriding, newPPS-oldPPS)
+			bestPPS = newPPS
+			bestCPU = newCPU
+		} else {
+			p.Printf("Previous Rx striding %t was better by %d, reverting\n", oldRxStriding, oldPPS-newPPS)
+			config.Striding = oldRxStriding
+			setConfig(ethHandle, config)
+			bestPPS = oldPPS
+			bestCPU = oldCPU
+		}
 	}
-	return config, maxDrop
+	return config, bestPPS, bestCPU
+}
+
+func changeWRMSR(ethHandle *ethtool.Ethtool, config Config, interval int, extDrop uint64) (Config, uint64, float64) {
+
+	oldPPS := getAction(ethHandle, config.Iface, interval, config.Action)
+	oldCPU := getAverageCPUPercentage(config.Weight)
+	oldNotProcessed := getNotProcessed(ethHandle, config.Iface, interval, config.Action)
+
+	var bestPPS uint64
+	var bestCPU float64
+	var newMSRval uint64
+	oldMSRval := config.MSRValue
+
+	if oldMSRval == 0x6000 {
+		newMSRval = 0x7fff
+	} else {
+		newMSRval = 0x6000
+	}
+
+	setMSR(newMSRval)
+
+	newPPS := getAction(ethHandle, config.Iface, interval, config.Action)
+	newCPU := getAverageCPUPercentage(config.Weight)
+	newNotProcessed := getNotProcessed(ethHandle, config.Iface, interval, config.Action)
+	p := message.NewPrinter(language.English)
+
+	if oldNotProcessed < DROPPED_THRESHOLD && newNotProcessed < DROPPED_THRESHOLD {
+		p.Printf("All processed, looking for lower CPU usage\n")
+		if newCPU < oldCPU {
+			p.Printf("New MSR %x is better by %d\n", newMSRval, newCPU-oldCPU)
+			config.MSRValue = newMSRval
+			bestPPS = newPPS
+			bestCPU = newCPU
+		} else {
+			p.Printf("Previous MSR %x was better by %d, reverting\n", oldMSRval, oldCPU-newCPU)
+			config.MSRValue = oldMSRval
+			setMSR(oldMSRval)
+			bestPPS = oldPPS
+			bestCPU = oldCPU
+		}
+	} else { // non li processa tutti cerca throughput maggiore
+		p.Printf("Not all processed, looking for higher throughput\n")
+
+		if float64(newPPS) > float64(oldPPS)*PPS_THRESHOLD && float64(newPPS) > float64(extDrop)*PPS_THRESHOLD {
+			p.Printf("New MSR %x is better by %d\n", newMSRval, newPPS-oldPPS)
+			config.MSRValue = newMSRval
+			bestPPS = newPPS
+			bestCPU = newCPU
+		} else {
+			p.Printf("Prevous MSR %x was better by %d, reverting\n", oldMSRval, oldPPS-newPPS)
+			config.MSRValue = oldMSRval
+			setMSR(oldMSRval)
+			bestPPS = oldPPS
+			bestCPU = oldCPU
+		}
+	}
+	return config, bestPPS, bestCPU
+
 }
 
 func createSlice(ones uint32, start uint32) [MAX_CORES]uint32 {
@@ -375,20 +622,60 @@ func createSlice(ones uint32, start uint32) [MAX_CORES]uint32 {
 
 func changeCPUCount(ethHandle *ethtool.Ethtool, config Config, interval int, extDrop uint64) (Config, uint64) {
 
+	oldWeight := config.Weight
+	oldCore := config.Cores
 	var maxDrop uint64
 
 	percentage := getAverageCPUPercentage(config.Weight)
 	if percentage > 80 && config.Cores < MAX_CORES {
+
 		config.Weight = createSlice(config.Cores+1, 0)
 		config.Cores++
+
 	} else if percentage < 60 && config.Cores > 1 {
+
+		percentages, err := cpu.Percent(time.Second, true)
+		percentages = percentages[:config.Cores-1]
+
+		if err != nil {
+			panic(err.Error())
+		}
+		maxPercent := slices.Max(percentages)
+		maxIndex := slices.Index(percentages, maxPercent)
+		minPercent := slices.Min(percentages)
+		minIndex := slices.Index(percentages, minPercent)
+		//traffic skewed
+		if maxPercent > 80 && minPercent < 60 {
+			fmt.Printf("CPU %d is max\n", maxIndex)
+			fmt.Printf("CPU %d is min\n", minIndex)
+			fmt.Printf("percentages %v\n", percentages)
+			equalizeIndir(ethHandle, config, uint32(minIndex), uint32(maxIndex))
+			//test
+			return config, extDrop
+		}
+
 		config.Weight = createSlice(config.Cores-1, 0)
 		config.Cores--
+
 	}
 
 	setIndir(ethHandle, config)
-	new := getDrop(ethHandle, config.Iface, interval)
-	maxDrop = new
+
+	new := getAction(ethHandle, config.Iface, interval, config.Action)
+
+	if float64(new) > float64(extDrop)*PPS_THRESHOLD {
+		fmt.Printf("New CPU %d more than prevoius\n", config.Cores)
+		maxDrop = new
+	} else {
+		fmt.Printf("Prevous CPU %d less than prevoius reverting\n", oldCore)
+		config.Cores = oldCore
+		config.Weight = oldWeight
+		setIndir(ethHandle, config)
+		maxDrop = extDrop
+	}
+
+	// maxDrop = new
+
 	return config, maxDrop
 }
 
@@ -404,42 +691,65 @@ func main() {
 
 	config := Config{
 		Iface:       "enp52s0f1np1",
+		Action:      "rx_xdp_drop",
 		Budget:      64,
 		RXQueue:     1024,
 		CQECompress: true,
 		Striding:    true,
 		Weight:      [32]uint32{1, 1, 1, 1, 1, 1, 1, 1, 1, 1},
 		Cores:       10,
+		MSR:         0xc8b,
+		MSRValue:    0x6000,
 	}
 	setConfig(ethHandle, config)
 	setIndir(ethHandle, config)
+	setMSR(config.MSRValue)
 
-	var drop uint64
+	// prova := ethtool.SetIndir{}
+	// newIndir := [256]uint32{0}
+	// newIndir[0] = 1
+	// prova.RingIndex = newIndir
+	// overrideIndir(ethHandle, config.Iface, prova)
+
+	// getAverageCPUPercentage(config.Weight)
+	// return
+
+	var pps uint64
+	var cpuUsage float64
 
 	xdpLink := attachXDP(config.Iface)
 	defer xdpLink.Close()
 
 	//baseline
-	drop = getDrop(ethHandle, config.Iface, INTERVAL)
-	writeCSV(writer, config, drop, getAverageCPUPercentage(config.Weight))
+	pps = getAction(ethHandle, config.Iface, INTERVAL, config.Action)
+	writeCSV(writer, config, pps, getAverageCPUPercentage(config.Weight))
+
+	// config.RXQueue = 128
+	// config.Budget = 2
+	// config.CQECompress = false
+	// config.Striding = false
+	// setConfig(ethHandle, config)
 
 	for {
-		drop = 0
+		pps = 0
 
-		config, drop = changeRxQueue(ethHandle, config, INTERVAL, drop)
-		writeCSV(writer, config, drop, getAverageCPUPercentage(config.Weight))
+		config, pps, cpuUsage = changeRxQueue(ethHandle, config, INTERVAL, pps)
+		writeCSV(writer, config, pps, cpuUsage)
 
-		config, drop = changeRxBudget(ethHandle, config, INTERVAL, drop)
-		writeCSV(writer, config, drop, getAverageCPUPercentage(config.Weight))
+		config, pps, cpuUsage = changeRxBudget(ethHandle, config, INTERVAL, pps)
+		writeCSV(writer, config, pps, cpuUsage)
 
-		config, drop = changeCqeCompress(ethHandle, config, INTERVAL, drop)
-		writeCSV(writer, config, drop, getAverageCPUPercentage(config.Weight))
+		config, pps, cpuUsage = changeCqeCompress(ethHandle, config, INTERVAL, pps)
+		writeCSV(writer, config, pps, cpuUsage)
 
-		config, drop = changeRxStriding(ethHandle, config, INTERVAL, drop)
-		writeCSV(writer, config, drop, getAverageCPUPercentage(config.Weight))
+		config, pps, cpuUsage = changeRxStriding(ethHandle, config, INTERVAL, pps)
+		writeCSV(writer, config, pps, cpuUsage)
 
-		config, drop = changeCPUCount(ethHandle, config, INTERVAL, drop)
-		writeCSV(writer, config, drop, getAverageCPUPercentage(config.Weight))
+		// config, pps, cpuUsage = changeCPUCount(ethHandle, config, INTERVAL, pps)
+		// writeCSV(writer, config, pps, cpuUsage)
+
+		config, pps, cpuUsage = changeWRMSR(ethHandle, config, INTERVAL, pps)
+		writeCSV(writer, config, pps, cpuUsage)
 
 	}
 

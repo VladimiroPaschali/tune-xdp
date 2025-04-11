@@ -147,6 +147,7 @@ int cms(struct xdp_md *ctx)
     hash(&pkt1, sizeof(pkt1), pkt1_hashes);
     countmin_add(cm, pkt1_hashes);
     return XDP_DROP;
+    // return XDP_TX;
 }
 
 char LICENSE[] SEC("license") = "Dual BSD/GPL";
